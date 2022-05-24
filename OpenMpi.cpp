@@ -8,107 +8,104 @@
 
 #include "misc.hpp"
 
-#define  MAX_ITERATIONS 1000
-const double diff =  0.001; // accuracy
+const double eps =  0.0001; // accuracy
 
 MPI_Status status;     
-int Numprocs, MyRank, Root = 0;
-
-double Distance(double *X_Old, double *X_New, int n_size)
-{
-   int  index;
-	double Sum;
-
-   Sum = 0.0;
-	for(index=0; index<n_size; index++)
-		 Sum += (X_New[index] - X_Old[index])*(X_New[index]-X_Old[index]);
-
-   return(Sum);
-}
+int num_procs, my_rank, Root = 0;
 
 /*
  * Solves A*X = F, X - init approximation and res 
  * of ith iteration
  */
-void Jacobi(double **Matrix_A, double *F, double *X, int N)
+void Jacobi(double *A, double *F, double *X, int N)
 {
-  	int n_size = N, NoofRows_Bloc;
-  	int irow, jrow, icol, index, Iteration, GlobalRowNo;
+  	int nb;
 
-	double *Input_B, *Input_A, *ARecv, *BRecv;
-	double *X_New, *X_Old, *Bloc_X, tmp;
+	double *X_New, *X_Old, *BlockX, tmp;
 
-	if (MyRank == Root) {
-		Input_B = new double[n_size];
-		for (int i = 0; i < n_size; i++)
-			Input_B[i] = F[i];
-
-		Input_A  = new double[n_size*n_size];
-	  	index = 0;
-	  	for(irow=0; irow<n_size; irow++)
-			for(icol=0; icol<n_size; icol++)
-				Input_A[index++] = Matrix_A[irow][icol];
+	nb = N / num_procs;
+	int *FBlockSz = new int[num_procs];
+	int *FBlockDisp = new int[num_procs];
+	int *ABlSz = new int[num_procs];
+	int *ABlDisp = new int[num_procs];
+	FBlockSz[0] = (N % num_procs > 0) ? nb + 1 : nb;
+	FBlockDisp[0] = 0;
+	ABlSz[0] = FBlockSz[0] * N;
+	ABlDisp[0] = 0;
+	for (int i = 1; i < num_procs; i++) {
+		FBlockSz[i] = (i < N % num_procs) ? nb + 1 : nb;
+		FBlockDisp[i] = FBlockDisp[i - 1] + FBlockSz[i - 1];
+		ABlSz[i] = FBlockSz[i] * N;
+		ABlDisp[i] = ABlDisp[i - 1] + ABlSz[i - 1];
 	}
 
-	MPI_Bcast(&n_size, 1, MPI_INT, Root, MPI_COMM_WORLD); 
 
-	NoofRows_Bloc = n_size/Numprocs;
-	ARecv = new double[NoofRows_Bloc * n_size];
-	BRecv = new double[NoofRows_Bloc];
+	double *BlockA = new double[FBlockSz[my_rank] * N];
+	double *BlockF = new double[FBlockSz[my_rank]];
 
-	MPI_Scatter (Input_A, NoofRows_Bloc * n_size, MPI_DOUBLE, ARecv, NoofRows_Bloc * n_size, 
-					MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Scatterv(A, ABlSz, ABlDisp, MPI_DOUBLE, BlockA, ABlSz[my_rank],
+	    MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-	MPI_Scatter (Input_B, NoofRows_Bloc, MPI_DOUBLE, BRecv, NoofRows_Bloc, MPI_DOUBLE, 0, 
-					MPI_COMM_WORLD);
-	X_New  = new double[n_size];
-	X_Old  = new double[n_size];
-	Bloc_X = new double[NoofRows_Bloc];
+	MPI_Scatterv(F, FBlockSz, FBlockDisp, MPI_DOUBLE, BlockF, FBlockSz[my_rank],
+	    MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-	for(irow=0; irow<NoofRows_Bloc; irow++)
-		Bloc_X[irow] = BRecv[irow];
+	X_New  = new double[N];
+	X_Old  = new double[N];
 
-	MPI_Barrier(MPI_COMM_WORLD);
-	MPI_Allgather(Bloc_X, NoofRows_Bloc, MPI_DOUBLE, X_New, NoofRows_Bloc, 
-					 MPI_DOUBLE, MPI_COMM_WORLD);
+	BlockX = new double[FBlockSz[my_rank]];
+	std::fill_n(BlockX, FBlockSz[my_rank], 0);
 
-  	long norm;
-  	do{
-		for(irow=0; irow<n_size; irow++)
-			X_Old[irow] = X_New[irow];
+	MPI_Allgatherv(BlockX, FBlockSz[my_rank], MPI_DOUBLE, X_New, FBlockSz,
+		       	FBlockDisp, MPI_DOUBLE, MPI_COMM_WORLD);
 
-      		for(irow=0; irow<NoofRows_Bloc; irow++){
 
-			GlobalRowNo = (MyRank * NoofRows_Bloc) + irow;
-			Bloc_X[irow] = BRecv[irow];
-			index = irow * n_size;
+	double norm;
+  	do {
+  		norm = 0;
 
-			for(icol=0; icol<GlobalRowNo; icol++)
-				Bloc_X[irow] -= X_Old[icol] * ARecv[index + icol];
-
-			for(icol=GlobalRowNo+1; icol<n_size; icol++)
-				Bloc_X[irow] -= X_Old[icol] * ARecv[index + icol];
-
-			Bloc_X[irow] = Bloc_X[irow] / ARecv[irow*n_size + GlobalRowNo];
+		for (int i = 0; i < N; i++) {
+			X_Old[i] = X_New[i];
 		}
 
-  		MPI_Allgather(Bloc_X, NoofRows_Bloc, MPI_DOUBLE, X_New, 
-				NoofRows_Bloc, MPI_DOUBLE, MPI_COMM_WORLD);
-	}while((Distance(X_Old, X_New, n_size) >= diff)); 
+		for (int i = 0; i < FBlockSz[my_rank]; i++) {
+			BlockX[i] = BlockF[i];	
+			int index = i * N;
 
-	if (MyRank == Root) {
-		delete[] Input_A;
-		delete[] Input_B;
+			for (int g = 0; g < N; g++) {
+				if (g != FBlockDisp[my_rank] + i)
+					BlockX[i] -= BlockA[index + g] * X_New[g];
+			}
+
+			BlockX[i] /= BlockA[index + FBlockDisp[my_rank] + i];
+		}
+
+		MPI_Allgatherv(BlockX, FBlockSz[my_rank], MPI_DOUBLE, X_New, FBlockSz,
+		       	FBlockDisp, MPI_DOUBLE, MPI_COMM_WORLD);
+
+		for (int i = 0; i < N; i++) {
+			if (fabs(X_New[i] - X_Old[i]) > norm)
+				norm = fabs(X_New[i] - X_Old[i]);
+		}
+
+	} while(norm > eps); 
+
+	if (my_rank == Root) {
 		
 		for (int i = 0; i < N; i++)
 			X[i] = X_New[i];
 	  
 	}
-	delete[] ARecv;
-	delete[] BRecv;
+
+	delete[] FBlockSz;
+	delete[] FBlockDisp;
+	delete[] ABlSz;
+	delete[] ABlDisp;
+
+	delete[] BlockA;
+	delete[] BlockF;
 	delete[] X_New;
 	delete[] X_Old;
-	delete[] Bloc_X;
+	delete[] BlockX;
 }
 
 /* run Jacobi with random data of dimension - N,
@@ -121,27 +118,28 @@ void test(long N)
 	vector<vector<double>> A(N, vector<double>(N));
 	vector<double> F(N);
 	vector<double> X(N);
-	double **A_m;
+	double *A_m;
 	double *F_arr, *X_arr;
 
-	if (MyRank == 0) {
+	if (my_rank == 0) {
 		random_diag_dorminant_matrix(A);
 		random_vector(F);
-		A_m = new double*[N];
-		for (long i = 0; i < N; i++) {
-			A_m[i] = new double[N];
-			for (long j = 0; j < N; j++)
-				A_m[i][j] = A[i][j];
-		}
 
 		gettimeofday(&tstart, NULL);
 		F_arr = F.data();
 		X_arr = X.data();
+
+		A_m  = new double[N*N];
+		int index = 0;
+		for(int i = 0; i < N; i++)
+			for(int j = 0; j < N; j++)
+				A_m[index++] = A[i][j];
+		
 	}
 
 	Jacobi(A_m, F_arr, X_arr, N);
 
-	if (MyRank == 0) {
+	if (my_rank == 0) {
 		
 		gettimeofday(&tend, NULL);
 		time_t sec = tend.tv_sec - tstart.tv_sec;
@@ -160,8 +158,6 @@ void test(long N)
 			err += (F_err[i] - F[i]) * (F_err[i] - F[i]);
 		}
 		cout << setw(20) << err << endl;
-		for (long i = 0; i < N; i++)
-			delete[] A_m[i];
 		delete[] A_m;
 	}
 }
@@ -170,11 +166,11 @@ int main(int argc, char *argv[])
 {
 	long N;
 	MPI_Init(&argc, &argv); 
-	MPI_Comm_rank(MPI_COMM_WORLD, &MyRank);
-	MPI_Comm_size(MPI_COMM_WORLD, &Numprocs);
+	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-	N = 10;
-	if (MyRank == 0) {
+	N = 100;
+	if (my_rank == 0) {
 		cout << "Test Number" << setw(15) << "Matrix Size" << setw(25)
 		<< "Execution time (sec)" << setw(10) << "Error" << endl;
 
@@ -182,87 +178,25 @@ int main(int argc, char *argv[])
 	}
 	test(N);
 
-	N = 100;
-	if (MyRank == 0) {
+	N = 1000;
+	if (my_rank == 0) {
 
 		cout << setw(5) << 2 << setw(16) << N;
 	}
 	test(N);
 
-	N = 1000;
-	if (MyRank == 0) {
+	N = 10000;
+	if (my_rank == 0) {
 
 		cout << setw(5) << 3 << setw(16) << N;
 	}
 	test(N);
 
-	N = 2000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 4 << setw(16) << N;
-	}
-	test(N);
-
-	N = 3000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 5 << setw(16) << N;
-	}
-	test(N);
-
-	N = 4000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 6 << setw(16) << N;
-	}
-	test(N);
-
-	N = 5000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 7 << setw(16) << N;
-	}
-	test(N);
-
-	N = 6000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 8 << setw(16) << N;
-	}
-	test(N);
-
-	N = 7000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 9 << setw(16) << N;
-	}
-	test(N);
-
-	N = 8000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 10 << setw(16) << N;
-	}
-	test(N);
-
-	N = 9000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 11 << setw(16) << N;
-	}
-	test(N);
-
-	N = 10000;
-	if (MyRank == 0) {
-
-		cout << setw(5) << 12 << setw(16) << N;
-	}
-	test(N);
-
-	if (MyRank == 0) {
-		cout << "Number of processors: " << Numprocs << endl;
+	if (my_rank == 0) {
+		cout << "Number of processors: " << num_procs << endl;
 	}
 
 	MPI_Finalize();
 
+	exit(0);
 }
